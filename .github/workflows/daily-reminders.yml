@@ -28,5 +28,6 @@ jobs:
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
           SYSTEM_USER_EMAIL: ${{ secrets.SYSTEM_USER_EMAIL }}
           SYSTEM_USER_PASSWORD: ${{ secrets.SYSTEM_USER_PASSWORD }}
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: node send-reminders.js
