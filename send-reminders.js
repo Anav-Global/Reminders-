@@ -1,17 +1,21 @@
-// This script authenticates as a dedicated "system" Firebase Auth user
-// (created via the app's own Users tab, role: manager) using the standard
-// email/password sign-in REST API, then reads Firestore over its REST API
-// using the resulting ID token. This avoids needing a service account key,
-// which this Google Workspace-linked project's organization policy blocks.
+const nodemailer = require("nodemailer");
 
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
 const SYSTEM_USER_EMAIL = process.env.SYSTEM_USER_EMAIL;
 const SYSTEM_USER_PASSWORD = process.env.SYSTEM_USER_PASSWORD;
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
 
-const FROM_ADDRESS = "Anav Task Manager <onboarding@resend.dev>";
 const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: GMAIL_USER,
+    pass: GMAIL_APP_PASSWORD,
+  },
+});
 
 function startOfDay(date) {
   const d = new Date(date);
@@ -24,8 +28,6 @@ function daysBetween(a, b) {
   return Math.round((startOfDay(a) - startOfDay(b)) / msPerDay);
 }
 
-// Converts a Firestore REST API "fields" object (typed value wrappers)
-// into a plain JS object.
 function parseFirestoreFields(fields) {
   const out = {};
   if (!fields) return out;
@@ -38,10 +40,7 @@ function parseFirestoreFields(fields) {
     else if (val.nullValue !== undefined) out[key] = null;
     else if (val.timestampValue !== undefined) out[key] = new Date(val.timestampValue);
     else if (val.arrayValue !== undefined) {
-      out[key] = (val.arrayValue.values || []).map((v) => {
-        if (v.stringValue !== undefined) return v.stringValue;
-        return v;
-      });
+      out[key] = (val.arrayValue.values || []).map((v) => (v.stringValue !== undefined ? v.stringValue : v));
     } else out[key] = null;
   }
   return out;
@@ -61,32 +60,21 @@ async function signIn() {
     }
   );
   const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`Sign-in failed: ${JSON.stringify(data)}`);
-  }
+  if (!res.ok) throw new Error(`Sign-in failed: ${JSON.stringify(data)}`);
   return data.idToken;
 }
 
 async function runQuery(idToken, structuredQuery) {
   const res = await fetch(`${FIRESTORE_BASE}:runQuery`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${idToken}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ structuredQuery }),
   });
   const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`Query failed: ${JSON.stringify(data)}`);
-  }
-  // Each result item has a `document` field (missing for empty-result placeholder rows).
+  if (!res.ok) throw new Error(`Query failed: ${JSON.stringify(data)}`);
   return data
     .filter((row) => row.document)
-    .map((row) => ({
-      id: row.document.name.split("/").pop(),
-      ...parseFirestoreFields(row.document.fields),
-    }));
+    .map((row) => ({ id: row.document.name.split("/").pop(), ...parseFirestoreFields(row.document.fields) }));
 }
 
 async function getDoc(idToken, collection, id) {
@@ -99,18 +87,16 @@ async function getDoc(idToken, collection, id) {
 }
 
 async function sendEmail(to, subject, html) {
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${RESEND_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ from: FROM_ADDRESS, to: [to], subject, html }),
-  });
-  if (!res.ok) {
-    console.error(`Failed to send email to ${to}:`, await res.text());
-  } else {
+  try {
+    await transporter.sendMail({
+      from: `"Anav Task Manager" <${GMAIL_USER}>`,
+      to,
+      subject,
+      html,
+    });
     console.log(`Sent email to ${to}: ${subject}`);
+  } catch (err) {
+    console.error(`Failed to send email to ${to}:`, err.message);
   }
 }
 
@@ -121,11 +107,7 @@ async function main() {
   const pendingTasks = await runQuery(idToken, {
     from: [{ collectionId: "tasks" }],
     where: {
-      fieldFilter: {
-        field: { fieldPath: "status" },
-        op: "EQUAL",
-        value: { stringValue: "pending" },
-      },
+      fieldFilter: { field: { fieldPath: "status" }, op: "EQUAL", value: { stringValue: "pending" } },
     },
   });
 
@@ -140,9 +122,7 @@ async function main() {
       fieldFilter: {
         field: { fieldPath: "role" },
         op: "IN",
-        value: {
-          arrayValue: { values: [{ stringValue: "tl" }, { stringValue: "manager" }] },
-        },
+        value: { arrayValue: { values: [{ stringValue: "tl" }, { stringValue: "manager" }] } },
       },
     },
   });
