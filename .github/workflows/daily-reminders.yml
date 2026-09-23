@@ -2,12 +2,16 @@ name: Daily Task Reminders
 
 on:
   schedule:
-    # 13:30 UTC = 7:00 PM IST (India is UTC+5:30). GitHub Actions cron
-    # is always in UTC — there is no timezone field.
+    # 13:30 UTC = 7:00 PM IST — shift start, full reminders.
     - cron: "30 13 * * *"
-  workflow_dispatch: {}
-    # Lets you manually trigger this from the GitHub Actions tab for
-    # testing, instead of waiting for the scheduled time.
+    # 22:30 UTC = 4:00 AM IST (next calendar day) — shift end, escalation only.
+    - cron: "30 22 * * *"
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "full or escalation-only (only used for manual test runs; scheduled runs set this automatically)"
+        required: false
+        default: "full"
 
 jobs:
   send-reminders:
@@ -30,4 +34,5 @@ jobs:
           SYSTEM_USER_PASSWORD: ${{ secrets.SYSTEM_USER_PASSWORD }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RUN_MODE: ${{ github.event.inputs.run_mode || (github.event.schedule == '30 22 * * *' && 'escalation-only' || 'full') }}
         run: node send-reminders.js
