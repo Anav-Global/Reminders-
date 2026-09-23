@@ -1,16 +1,17 @@
-const admin = require("firebase-admin");
+// This script authenticates as a dedicated "system" Firebase Auth user
+// (created via the app's own Users tab, role: manager) using the standard
+// email/password sign-in REST API, then reads Firestore over its REST API
+// using the resulting ID token. This avoids needing a service account key,
+// which this Google Workspace-linked project's organization policy blocks.
 
-// Service account JSON is passed in as a GitHub Actions secret (a full JSON
-// string), decoded here rather than committed to the repo as a file.
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
-const db = admin.firestore();
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
+const SYSTEM_USER_EMAIL = process.env.SYSTEM_USER_EMAIL;
+const SYSTEM_USER_PASSWORD = process.env.SYSTEM_USER_PASSWORD;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
+
 const FROM_ADDRESS = "Anav Task Manager <onboarding@resend.dev>";
+const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
 
 function startOfDay(date) {
   const d = new Date(date);
@@ -23,6 +24,80 @@ function daysBetween(a, b) {
   return Math.round((startOfDay(a) - startOfDay(b)) / msPerDay);
 }
 
+// Converts a Firestore REST API "fields" object (typed value wrappers)
+// into a plain JS object.
+function parseFirestoreFields(fields) {
+  const out = {};
+  if (!fields) return out;
+  for (const key of Object.keys(fields)) {
+    const val = fields[key];
+    if (val.stringValue !== undefined) out[key] = val.stringValue;
+    else if (val.integerValue !== undefined) out[key] = parseInt(val.integerValue, 10);
+    else if (val.doubleValue !== undefined) out[key] = val.doubleValue;
+    else if (val.booleanValue !== undefined) out[key] = val.booleanValue;
+    else if (val.nullValue !== undefined) out[key] = null;
+    else if (val.timestampValue !== undefined) out[key] = new Date(val.timestampValue);
+    else if (val.arrayValue !== undefined) {
+      out[key] = (val.arrayValue.values || []).map((v) => {
+        if (v.stringValue !== undefined) return v.stringValue;
+        return v;
+      });
+    } else out[key] = null;
+  }
+  return out;
+}
+
+async function signIn() {
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: SYSTEM_USER_EMAIL,
+        password: SYSTEM_USER_PASSWORD,
+        returnSecureToken: true,
+      }),
+    }
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Sign-in failed: ${JSON.stringify(data)}`);
+  }
+  return data.idToken;
+}
+
+async function runQuery(idToken, structuredQuery) {
+  const res = await fetch(`${FIRESTORE_BASE}:runQuery`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ structuredQuery }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Query failed: ${JSON.stringify(data)}`);
+  }
+  // Each result item has a `document` field (missing for empty-result placeholder rows).
+  return data
+    .filter((row) => row.document)
+    .map((row) => ({
+      id: row.document.name.split("/").pop(),
+      ...parseFirestoreFields(row.document.fields),
+    }));
+}
+
+async function getDoc(idToken, collection, id) {
+  const res = await fetch(`${FIRESTORE_BASE}/${collection}/${id}`, {
+    headers: { Authorization: `Bearer ${idToken}` },
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return parseFirestoreFields(data.fields);
+}
+
 async function sendEmail(to, subject, html) {
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -32,24 +107,46 @@ async function sendEmail(to, subject, html) {
     },
     body: JSON.stringify({ from: FROM_ADDRESS, to: [to], subject, html }),
   });
-
   if (!res.ok) {
-    const errText = await res.text();
-    console.error(`Failed to send email to ${to}:`, errText);
+    console.error(`Failed to send email to ${to}:`, await res.text());
   } else {
     console.log(`Sent email to ${to}: ${subject}`);
   }
 }
 
 async function main() {
+  const idToken = await signIn();
   const today = new Date();
 
-  const tasksSnap = await db.collection("tasks").where("status", "==", "pending").get();
+  const pendingTasks = await runQuery(idToken, {
+    from: [{ collectionId: "tasks" }],
+    where: {
+      fieldFilter: {
+        field: { fieldPath: "status" },
+        op: "EQUAL",
+        value: { stringValue: "pending" },
+      },
+    },
+  });
 
-  if (tasksSnap.empty) {
+  if (pendingTasks.length === 0) {
     console.log("No pending tasks found.");
     return;
   }
+
+  const managers = await runQuery(idToken, {
+    from: [{ collectionId: "users" }],
+    where: {
+      fieldFilter: {
+        field: { fieldPath: "role" },
+        op: "IN",
+        value: {
+          arrayValue: { values: [{ stringValue: "tl" }, { stringValue: "manager" }] },
+        },
+      },
+    },
+  });
+  const managerEmails = managers.map((m) => m.email).filter(Boolean);
 
   const userCache = new Map();
   const clientCache = new Map();
@@ -57,8 +154,7 @@ async function main() {
   async function getUser(uid) {
     if (!uid) return null;
     if (userCache.has(uid)) return userCache.get(uid);
-    const snap = await db.collection("users").doc(uid).get();
-    const data = snap.exists ? snap.data() : null;
+    const data = await getDoc(idToken, "users", uid);
     userCache.set(uid, data);
     return data;
   }
@@ -66,30 +162,25 @@ async function main() {
   async function getClientName(clientId) {
     if (!clientId) return "Unknown Client";
     if (clientCache.has(clientId)) return clientCache.get(clientId);
-    const snap = await db.collection("clients").doc(clientId).get();
-    const name = snap.exists ? snap.data().name : "Unknown Client";
+    const data = await getDoc(idToken, "clients", clientId);
+    const name = data ? data.name : "Unknown Client";
     clientCache.set(clientId, name);
     return name;
   }
 
-  const managersSnap = await db.collection("users").where("role", "in", ["tl", "manager"]).get();
-  const managerEmails = managersSnap.docs.map((d) => d.data().email).filter(Boolean);
-
   let remindersSent = 0;
   let escalationsSent = 0;
 
-  for (const doc of tasksSnap.docs) {
-    const task = doc.data();
+  for (const task of pendingTasks) {
     if (!task.due_date || !task.assigned_to) continue;
 
-    const dueDate = task.due_date.toDate();
+    const dueDate = new Date(task.due_date);
     const diff = daysBetween(dueDate, today);
-
     if (diff > 3) continue;
 
     const assignee = await getUser(task.assigned_to);
     if (!assignee || !assignee.email) {
-      console.warn(`Task ${doc.id} has no resolvable assignee email, skipping.`);
+      console.warn(`Task ${task.id} has no resolvable assignee email, skipping.`);
       continue;
     }
 
@@ -141,9 +232,7 @@ async function main() {
   console.log(`Run complete. Reminders sent: ${remindersSent}. Manager escalations sent: ${escalationsSent}.`);
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((err) => {
-    console.error("Script failed:", err);
-    process.exit(1);
-  });
+main().catch((err) => {
+  console.error("Script failed:", err);
+  process.exit(1);
+});
