@@ -7,6 +7,16 @@ const SYSTEM_USER_PASSWORD = process.env.SYSTEM_USER_PASSWORD;
 const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
 
+// "full" (default, used at shift start / 7 PM run): sends reminders for
+// anything due within 3 days, due today, or overdue, plus manager
+// escalation for overdue tasks.
+// "escalation-only" (used at shift end / 4 AM run): skips the ordinary
+// "due soon" reminders entirely — only tasks that are genuinely overdue
+// by this point get an email, to the assignee and to managers. This
+// avoids re-sending a same-day reminder that was already sent at 7 PM
+// for tasks that aren't actually late yet.
+const RUN_MODE = process.env.RUN_MODE || "full";
+
 const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
 
 const transporter = nodemailer.createTransport({
@@ -158,6 +168,11 @@ async function main() {
     const diff = daysBetween(dueDate, today);
     if (diff > 3) continue;
 
+    // In escalation-only mode (the shift-end run), skip anything that
+    // isn't actually overdue yet — those already got their reminder at
+    // shift start and don't need a repeat this soon.
+    if (RUN_MODE === "escalation-only" && diff >= 0) continue;
+
     const assignee = await getUser(task.assigned_to);
     if (!assignee || !assignee.email) {
       console.warn(`Task ${task.id} has no resolvable assignee email, skipping.`);
@@ -209,7 +224,9 @@ async function main() {
     }
   }
 
-  console.log(`Run complete. Reminders sent: ${remindersSent}. Manager escalations sent: ${escalationsSent}.`);
+  console.log(
+    `Run complete (mode: ${RUN_MODE}). Reminders sent: ${remindersSent}. Manager escalations sent: ${escalationsSent}.`
+  );
 }
 
 main().catch((err) => {
