@@ -167,9 +167,14 @@ function computeMissingCycles(template, existingDateKeys, today) {
       if (!existingDateKeys.has(key)) {
         missing.push({ dueDate: shifted, key });
       }
-      if (daysBetween(shifted, today) <= 0) {
+      if (daysBetween(shifted, today) >= 0) {
         // This cycle is today or in the future — stop after this one.
         break;
+      }
+      if (i === 499) {
+        console.warn(
+          `Safety cap hit while walking cycles for template — this likely means a bug or bad anchor_date. Stopped at ${key}.`
+        );
       }
       cursor = addFn(cursor);
     }
