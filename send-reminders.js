@@ -29,17 +29,12 @@ function daysBetween(a, b) {
 }
 
 function dateKey(date) {
-  // Calendar-day key, ignoring time-of-day, so existence checks aren't
-  // thrown off by small time differences between how the React app and
-  // this script construct due_date timestamps.
-  const d = startOfDay(date);
-  return d.toISOString().slice(0, 10);
+  return startOfDay(date).toISOString().slice(0, 10);
 }
 
-// Saturday -> Friday, Sunday -> Friday. Matches the app's 5-day work week.
 function shiftToFridayIfWeekend(date) {
   const d = new Date(date);
-  const day = d.getDay(); // 0 = Sunday, 6 = Saturday
+  const day = d.getDay();
   if (day === 6) d.setDate(d.getDate() - 1);
   else if (day === 0) d.setDate(d.getDate() - 2);
   return d;
@@ -88,9 +83,7 @@ function toFirestoreValue(v) {
 
 function toFirestoreFields(obj) {
   const fields = {};
-  for (const key of Object.keys(obj)) {
-    fields[key] = toFirestoreValue(obj[key]);
-  }
+  for (const key of Object.keys(obj)) fields[key] = toFirestoreValue(obj[key]);
   return { fields };
 }
 
@@ -100,11 +93,7 @@ async function signIn() {
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        email: SYSTEM_USER_EMAIL,
-        password: SYSTEM_USER_PASSWORD,
-        returnSecureToken: true,
-      }),
+      body: JSON.stringify({ email: SYSTEM_USER_EMAIL, password: SYSTEM_USER_PASSWORD, returnSecureToken: true }),
     }
   );
   const data = await res.json();
@@ -126,9 +115,7 @@ async function runQuery(idToken, structuredQuery) {
 }
 
 async function getDoc(idToken, collection, id) {
-  const res = await fetch(`${FIRESTORE_BASE}/${collection}/${id}`, {
-    headers: { Authorization: `Bearer ${idToken}` },
-  });
+  const res = await fetch(`${FIRESTORE_BASE}/${collection}/${id}`, { headers: { Authorization: `Bearer ${idToken}` } });
   if (!res.ok) return null;
   const data = await res.json();
   return parseFirestoreFields(data.fields);
@@ -150,31 +137,18 @@ async function createDoc(idToken, collection, dataObj) {
 
 // ---------- recurrence generation ----------
 
-// Given a template and the set of due-date day-keys that already have a
-// task instance, figures out which cycles (up to and including the first
-// one that is today-or-future) are missing, and returns their due dates.
 function computeMissingCycles(template, existingDateKeys, today) {
   const missing = [];
 
   function walkFixedPeriod(anchor, addFn) {
     let cursor = new Date(anchor);
-    // Safety cap: never walk more than 500 cycles back, in case of a
-    // very old anchor with a tight period (e.g. daily) — avoids a
-    // runaway loop if something is misconfigured.
     for (let i = 0; i < 500; i++) {
       const shifted = shiftToFridayIfWeekend(cursor);
       const key = dateKey(shifted);
-      if (!existingDateKeys.has(key)) {
-        missing.push({ dueDate: shifted, key });
-      }
-      if (daysBetween(shifted, today) >= 0) {
-        // This cycle is today or in the future — stop after this one.
-        break;
-      }
+      if (!existingDateKeys.has(key)) missing.push({ dueDate: shifted, key });
+      if (daysBetween(shifted, today) >= 0) break;
       if (i === 499) {
-        console.warn(
-          `Safety cap hit while walking cycles for template — this likely means a bug or bad anchor_date. Stopped at ${key}.`
-        );
+        console.warn(`Safety cap hit walking cycles for template "${template.title}" — check its anchor_date.`);
       }
       cursor = addFn(cursor);
     }
@@ -182,15 +156,15 @@ function computeMissingCycles(template, existingDateKeys, today) {
 
   if (template.frequency === "daily") {
     walkFixedPeriod(template.anchor_date, (d) => {
-      const next = new Date(d);
-      next.setDate(next.getDate() + 1);
-      return next;
+      const n = new Date(d);
+      n.setDate(n.getDate() + 1);
+      return n;
     });
   } else if (template.frequency === "weekly") {
     walkFixedPeriod(template.anchor_date, (d) => {
-      const next = new Date(d);
-      next.setDate(next.getDate() + 7);
-      return next;
+      const n = new Date(d);
+      n.setDate(n.getDate() + 7);
+      return n;
     });
   } else if (template.frequency === "monthly") {
     const anchorDay = new Date(template.anchor_date).getDate();
@@ -202,14 +176,8 @@ function computeMissingCycles(template, existingDateKeys, today) {
     const anchorDay = new Date(template.anchor_date).getDate();
     walkFixedPeriod(template.anchor_date, (d) => addMonthsClamped(d, 12, anchorDay));
   } else if (template.frequency === "semi_monthly") {
-    // Simplified vs. a full historical walk: generates this month's and
-    // (if needed) next month's occurrence for each anchor day. This
-    // covers the current cycle reliably; it does not backfill deep
-    // historical gaps for semi-monthly templates the way the other
-    // frequencies do, since no starting year/month is stored for this
-    // frequency type in the schema.
-    for (const anchorDayField of ["anchor_day_1", "anchor_day_2"]) {
-      const anchorDay = template[anchorDayField];
+    for (const field of ["anchor_day_1", "anchor_day_2"]) {
+      const anchorDay = template[field];
       if (!anchorDay) continue;
       for (const monthOffset of [0, 1]) {
         const base = addMonthsClamped(today, monthOffset, anchorDay);
@@ -232,16 +200,12 @@ async function generateMissingTaskInstances(idToken, today) {
   });
 
   let created = 0;
-
   for (const template of templates) {
     const existingTasks = await runQuery(idToken, {
       from: [{ collectionId: "tasks" }],
       where: { fieldFilter: { field: { fieldPath: "template_id" }, op: "EQUAL", value: { stringValue: template.id } } },
     });
-    const existingDateKeys = new Set(
-      existingTasks.filter((t) => t.due_date).map((t) => dateKey(new Date(t.due_date)))
-    );
-
+    const existingDateKeys = new Set(existingTasks.filter((t) => t.due_date).map((t) => dateKey(new Date(t.due_date))));
     const missingCycles = computeMissingCycles(template, existingDateKeys, today);
 
     for (const cycle of missingCycles) {
@@ -262,7 +226,6 @@ async function generateMissingTaskInstances(idToken, today) {
       console.log(`Generated task instance for template "${template.title}" due ${cycle.key}`);
     }
   }
-
   console.log(`Recurrence generation complete. Created ${created} task instance(s).`);
 }
 
@@ -275,6 +238,20 @@ async function sendEmail(to, subject, html) {
   } catch (err) {
     console.error(`Failed to send email to ${to}:`, err.message);
   }
+}
+
+function taskRowHtml(item) {
+  const statusLine =
+    item.diff < 0
+      ? `<strong style="color:#b91c1c;">Overdue by ${Math.abs(item.diff)} day(s)</strong>`
+      : item.diff === 0
+      ? `<strong style="color:#b45309;">Due today</strong>`
+      : `Due in ${item.diff} day(s)`;
+  return `
+    <li style="margin-bottom:10px;">
+      <strong>${item.task.title}</strong> — ${item.clientName}<br/>
+      Due: ${item.dueDate.toDateString()} · ${statusLine}
+    </li>`;
 }
 
 async function main() {
@@ -325,8 +302,10 @@ async function main() {
     return name;
   }
 
-  let remindersSent = 0;
-  let escalationsSent = 0;
+  // Group everything by assignee, and separately collect overdue items for
+  // the manager escalation digest — one email per person, not one per task.
+  const byAssignee = new Map(); // uid -> { name, email, items: [] }
+  const overdueForManagers = []; // { assigneeName, item }
 
   for (const task of pendingTasks) {
     if (!task.due_date || !task.assigned_to) continue;
@@ -343,52 +322,73 @@ async function main() {
     }
 
     const clientName = await getClientName(task.client_id);
+    const item = { task, dueDate, diff, clientName };
 
-    const statusLine =
-      diff < 0
-        ? `<strong style="color:#b91c1c;">Overdue by ${Math.abs(diff)} day(s)</strong>`
-        : diff === 0
-        ? `<strong style="color:#b45309;">Due today</strong>`
-        : `Due in ${diff} day(s)`;
+    if (!byAssignee.has(task.assigned_to)) {
+      byAssignee.set(task.assigned_to, { name: assignee.name, email: assignee.email, items: [] });
+    }
+    byAssignee.get(task.assigned_to).items.push(item);
+
+    if (diff < 0) {
+      overdueForManagers.push({ assigneeName: assignee.name || assignee.email, item });
+    }
+  }
+
+  let remindersSent = 0;
+  let escalationsSent = 0;
+
+  // One consolidated email per employee.
+  for (const [, { name, email, items }] of byAssignee) {
+    if (items.length === 0) continue;
+    items.sort((a, b) => a.dueDate - b.dueDate);
+
+    const hasOverdue = items.some((i) => i.diff < 0);
+    const subject = hasOverdue
+      ? `You have ${items.length} task(s) needing attention (some overdue)`
+      : `You have ${items.length} task(s) coming up`;
 
     const html = `
-      <p>Hi ${assignee.name || "there"},</p>
-      <p>This is a reminder about a task assigned to you:</p>
-      <ul>
-        <li><strong>Task:</strong> ${task.title}</li>
-        <li><strong>Client:</strong> ${clientName}</li>
-        <li><strong>Due date:</strong> ${dueDate.toDateString()}</li>
-        <li>${statusLine}</li>
-      </ul>
-      <p>Please complete it in the dashboard and mark it done, or add a comment explaining any delay.</p>
+      <p>Hi ${name || "there"},</p>
+      <p>Here's a summary of your tasks that need attention:</p>
+      <ul>${items.map(taskRowHtml).join("")}</ul>
+      <p>Please complete each in the dashboard and mark it done, or add a comment explaining any delay.</p>
     `;
 
-    await sendEmail(
-      assignee.email,
-      diff < 0 ? `Overdue: ${task.title}` : `Reminder: ${task.title} due soon`,
-      html
-    );
+    await sendEmail(email, subject, html);
     remindersSent++;
+  }
 
-    if (diff < 0 && managerEmails.length > 0) {
-      const escalationHtml = `
-        <p>The following task assigned to <strong>${assignee.name || assignee.email}</strong> is overdue:</p>
-        <ul>
-          <li><strong>Task:</strong> ${task.title}</li>
-          <li><strong>Client:</strong> ${clientName}</li>
-          <li><strong>Due date:</strong> ${dueDate.toDateString()}</li>
-          <li><strong>Overdue by:</strong> ${Math.abs(diff)} day(s)</li>
-        </ul>
-      `;
-      for (const mgrEmail of managerEmails) {
-        await sendEmail(mgrEmail, `Overdue task: ${task.title}`, escalationHtml);
-        escalationsSent++;
-      }
+  // One consolidated escalation email per manager/TL, listing every overdue
+  // item across all employees, instead of one email per overdue task.
+  if (overdueForManagers.length > 0 && managerEmails.length > 0) {
+    const grouped = new Map(); // assigneeName -> [items]
+    for (const { assigneeName, item } of overdueForManagers) {
+      if (!grouped.has(assigneeName)) grouped.set(assigneeName, []);
+      grouped.get(assigneeName).push(item);
+    }
+
+    const sections = [...grouped.entries()]
+      .map(
+        ([assigneeName, items]) => `
+        <h4>${assigneeName}</h4>
+        <ul>${items.map(taskRowHtml).join("")}</ul>
+      `
+      )
+      .join("");
+
+    const escalationHtml = `
+      <p>The following tasks are currently overdue:</p>
+      ${sections}
+    `;
+
+    for (const mgrEmail of managerEmails) {
+      await sendEmail(mgrEmail, `${overdueForManagers.length} overdue task(s) across the team`, escalationHtml);
+      escalationsSent++;
     }
   }
 
   console.log(
-    `Run complete (mode: ${RUN_MODE}). Reminders sent: ${remindersSent}. Manager escalations sent: ${escalationsSent}.`
+    `Run complete (mode: ${RUN_MODE}). Employee digest emails sent: ${remindersSent}. Manager escalation emails sent: ${escalationsSent}.`
   );
 }
 
