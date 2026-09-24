@@ -35,4 +35,4 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RUN_MODE: ${{ github.event.inputs.run_mode || (github.event.schedule == '30 22 * * *' && 'escalation-only' || 'full') }}
-        run: node node send-reminders.js
+        run: node send-reminders.js
