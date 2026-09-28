@@ -316,23 +316,34 @@ async function main() {
     if (diff > 3) continue;
     if (RUN_MODE === "escalation-only" && diff >= 0) continue;
 
-    const assignee = await getUser(task.assigned_to);
-    if (!assignee || !assignee.email) {
-      console.warn(`Task ${task.id} has no resolvable assignee email, skipping.`);
-      continue;
-    }
-
     const clientName = await getClientName(task.client_id);
-    const item = { task, dueDate, diff, clientName, assigneeName: assignee.name || assignee.email };
 
-    if (!byAssignee.has(task.assigned_to)) {
-      byAssignee.set(task.assigned_to, { name: assignee.name, email: assignee.email, items: [] });
+    // assigned_to may be an array (multiple employees) or, for older
+    // tasks created before multi-assignee support, a plain string —
+    // normalize to an array either way so nothing downstream breaks.
+    const assigneeIds = Array.isArray(task.assigned_to) ? task.assigned_to : [task.assigned_to];
+
+    const resolvedAssignees = [];
+    for (const uid of assigneeIds) {
+      const assignee = await getUser(uid);
+      if (assignee && assignee.email) {
+        resolvedAssignees.push({ uid, name: assignee.name, email: assignee.email });
+      } else {
+        console.warn(`Task ${task.id} has an assignee (${uid}) with no resolvable email, skipping them.`);
+      }
     }
-    byAssignee.get(task.assigned_to).items.push(item);
+    if (resolvedAssignees.length === 0) continue;
 
-    // NEW: if this task has a designated Team Lead, they get the same
-    // reminder content as the employee, consolidated per TL (not one
-    // email per task).
+    const allAssigneeNames = resolvedAssignees.map((a) => a.name || a.email).join(", ");
+    const item = { task, dueDate, diff, clientName, assigneeName: allAssigneeNames };
+
+    for (const assignee of resolvedAssignees) {
+      if (!byAssignee.has(assignee.uid)) {
+        byAssignee.set(assignee.uid, { name: assignee.name, email: assignee.email, items: [] });
+      }
+      byAssignee.get(assignee.uid).items.push(item);
+    }
+
     if (task.tl_id) {
       const tl = await getUser(task.tl_id);
       if (tl && tl.email) {
@@ -346,7 +357,7 @@ async function main() {
     }
 
     if (diff < 0) {
-      overdueForManagers.push({ assigneeName: item.assigneeName, item });
+      overdueForManagers.push({ assigneeName: allAssigneeNames, item });
     }
   }
 
