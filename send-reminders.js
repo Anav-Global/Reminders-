@@ -215,6 +215,7 @@ async function generateMissingTaskInstances(idToken, today) {
         title: template.title,
         description: template.description || "",
         assigned_to: template.assigned_to,
+        tl_id: template.tl_id || null,
         due_date: cycle.dueDate,
         status: "pending",
         created_by: "system-recurrence",
@@ -240,16 +241,17 @@ async function sendEmail(to, subject, html) {
   }
 }
 
-function taskRowHtml(item) {
+function taskRowHtml(item, options = {}) {
   const statusLine =
     item.diff < 0
       ? `<strong style="color:#b91c1c;">Overdue by ${Math.abs(item.diff)} day(s)</strong>`
       : item.diff === 0
       ? `<strong style="color:#b45309;">Due today</strong>`
       : `Due in ${item.diff} day(s)`;
+  const assigneeLine = options.showAssignee ? ` (assigned to ${item.assigneeName})` : "";
   return `
     <li style="margin-bottom:10px;">
-      <strong>${item.task.title}</strong> — ${item.clientName}<br/>
+      <strong>${item.task.title}</strong>${assigneeLine} — ${item.clientName}<br/>
       Due: ${item.dueDate.toDateString()} · ${statusLine}
     </li>`;
 }
@@ -302,9 +304,8 @@ async function main() {
     return name;
   }
 
-  // Group everything by assignee, and separately collect overdue items for
-  // the manager escalation digest — one email per person, not one per task.
   const byAssignee = new Map(); // uid -> { name, email, items: [] }
+  const byTL = new Map(); // tl uid -> { name, email, items: [] } — items carry assigneeName too
   const overdueForManagers = []; // { assigneeName, item }
 
   for (const task of pendingTasks) {
@@ -322,65 +323,84 @@ async function main() {
     }
 
     const clientName = await getClientName(task.client_id);
-    const item = { task, dueDate, diff, clientName };
+    const item = { task, dueDate, diff, clientName, assigneeName: assignee.name || assignee.email };
 
     if (!byAssignee.has(task.assigned_to)) {
       byAssignee.set(task.assigned_to, { name: assignee.name, email: assignee.email, items: [] });
     }
     byAssignee.get(task.assigned_to).items.push(item);
 
+    // NEW: if this task has a designated Team Lead, they get the same
+    // reminder content as the employee, consolidated per TL (not one
+    // email per task).
+    if (task.tl_id) {
+      const tl = await getUser(task.tl_id);
+      if (tl && tl.email) {
+        if (!byTL.has(task.tl_id)) {
+          byTL.set(task.tl_id, { name: tl.name, email: tl.email, items: [] });
+        }
+        byTL.get(task.tl_id).items.push(item);
+      } else {
+        console.warn(`Task ${task.id} has tl_id ${task.tl_id} but no resolvable TL email, skipping TL notify.`);
+      }
+    }
+
     if (diff < 0) {
-      overdueForManagers.push({ assigneeName: assignee.name || assignee.email, item });
+      overdueForManagers.push({ assigneeName: item.assigneeName, item });
     }
   }
 
   let remindersSent = 0;
+  let tlDigestsSent = 0;
   let escalationsSent = 0;
 
-  // One consolidated email per employee.
+  // One consolidated email per employee (their own tasks only).
   for (const [, { name, email, items }] of byAssignee) {
     if (items.length === 0) continue;
     items.sort((a, b) => a.dueDate - b.dueDate);
-
     const hasOverdue = items.some((i) => i.diff < 0);
     const subject = hasOverdue
       ? `You have ${items.length} task(s) needing attention (some overdue)`
       : `You have ${items.length} task(s) coming up`;
-
     const html = `
       <p>Hi ${name || "there"},</p>
       <p>Here's a summary of your tasks that need attention:</p>
-      <ul>${items.map(taskRowHtml).join("")}</ul>
+      <ul>${items.map((i) => taskRowHtml(i)).join("")}</ul>
       <p>Please complete each in the dashboard and mark it done, or add a comment explaining any delay.</p>
     `;
-
     await sendEmail(email, subject, html);
     remindersSent++;
   }
 
-  // One consolidated escalation email per manager/TL, listing every overdue
-  // item across all employees, instead of one email per overdue task.
+  // One consolidated digest per Team Lead, covering every task across every
+  // employee where this TL was specifically attached to the task.
+  for (const [, { name, email, items }] of byTL) {
+    if (items.length === 0) continue;
+    items.sort((a, b) => a.dueDate - b.dueDate);
+    const hasOverdue = items.some((i) => i.diff < 0);
+    const subject = hasOverdue
+      ? `Team update: ${items.length} task(s) needing attention (some overdue)`
+      : `Team update: ${items.length} task(s) coming up`;
+    const html = `
+      <p>Hi ${name || "there"},</p>
+      <p>Here's a summary of your team's tasks that need attention:</p>
+      <ul>${items.map((i) => taskRowHtml(i, { showAssignee: true })).join("")}</ul>
+    `;
+    await sendEmail(email, subject, html);
+    tlDigestsSent++;
+  }
+
+  // Existing company-wide overdue escalation to every TL/manager — unchanged.
   if (overdueForManagers.length > 0 && managerEmails.length > 0) {
-    const grouped = new Map(); // assigneeName -> [items]
+    const grouped = new Map();
     for (const { assigneeName, item } of overdueForManagers) {
       if (!grouped.has(assigneeName)) grouped.set(assigneeName, []);
       grouped.get(assigneeName).push(item);
     }
-
     const sections = [...grouped.entries()]
-      .map(
-        ([assigneeName, items]) => `
-        <h4>${assigneeName}</h4>
-        <ul>${items.map(taskRowHtml).join("")}</ul>
-      `
-      )
+      .map(([assigneeName, items]) => `<h4>${assigneeName}</h4><ul>${items.map((i) => taskRowHtml(i)).join("")}</ul>`)
       .join("");
-
-    const escalationHtml = `
-      <p>The following tasks are currently overdue:</p>
-      ${sections}
-    `;
-
+    const escalationHtml = `<p>The following tasks are currently overdue:</p>${sections}`;
     for (const mgrEmail of managerEmails) {
       await sendEmail(mgrEmail, `${overdueForManagers.length} overdue task(s) across the team`, escalationHtml);
       escalationsSent++;
@@ -388,7 +408,7 @@ async function main() {
   }
 
   console.log(
-    `Run complete (mode: ${RUN_MODE}). Employee digest emails sent: ${remindersSent}. Manager escalation emails sent: ${escalationsSent}.`
+    `Run complete (mode: ${RUN_MODE}). Employee digests: ${remindersSent}. TL digests: ${tlDigestsSent}. Manager escalations: ${escalationsSent}.`
   );
 }
 
